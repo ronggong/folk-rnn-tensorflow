@@ -77,9 +77,10 @@ print('min, max length', min(tune_lens), max(tune_lens))
 
 x = tf.placeholder(tf.int32, [config.batch_size, None])
 mask = tf.placeholder(tf.float32, [config.batch_size, None])
+prob_dropout = tf.placeholder_with_default(0.0, shape=())
 
 # model graph
-def build_graph(x, mask):
+def build_graph(x, mask, prob_dropout):
     W_emb = tf.Variable(tf.eye(vocab_size, dtype=tf.float32), name='w_emb')
     l_emb = tf.nn.embedding_lookup(W_emb, x)
 
@@ -93,13 +94,31 @@ def build_graph(x, mask):
     rnn_output = tf.keras.layers.RNN(cells)(l_emb)
 
     if config.dropout > 0:
-        rnn_output = tf.keras.layers.Dropout(config.dropout)(rnn_output)
+        rnn_output = tf.keras.layers.Dropout(prob_dropout)(rnn_output)
 
     l_reshp = tf.reshape(rnn_output, (-1, config.rnn_size))
-    l_out = tf.keras.layers.Dense(units=vocab_size, kernel_initializer=tf.initializers.orthogonal, activation=tf.nn.softmax)
-    predictions = l_out
+    l_out = tf.keras.layers.Dense(units=vocab_size, 
+                                  kernel_initializer=tf.initializers.orthogonal, 
+                                  activation=tf.nn.softmax)(l_reshp)
 
-    y = tf.keras.layers.Flatten()(x[:, 1:])
+    y = tf.keras.backend.flatten(x[:, 1:])
+
+    # training loss
+    # predictions, dim_0: sample number, dim_1: the next token in the sample
+    index = tf.stack([tf.range(tf.shape(y)[0]), y], axis=1)
+    p1 = tf.reshape(tf.log(tf.gather_nd(l_out, index)), tf.shape(mask))
+    # mask the short sequence value , 
+    # sum on the timestamp axis, and then sum on the sample axis
+    loss = -1. * tf.reduce_mean(tf.reduce_sum(mask * p1, axis=1), axis=0)
+
+    optimizer = tf.train.RMSPropOptimizer(learning_rate=config.learning_rate)
+    gradients, variables = zip(*optimizer.compute_gradients(loss))
+    gradients, _ = tf.clip_by_global_norm(gradients, config.grad_clipping)
+    train_op = optimizer.apply_gradients(zip(gradients, variables))
+    # train_op = optimizer.minimize(loss)
+
+    init = tf.global_variables_initializer()
+    return init, train_op, loss
 
 # create batch
 def create_batch(idxs):
@@ -137,49 +156,55 @@ if hasattr(config, 'resume_path'):
     # learning_rate.set_value(resume_metadata['learning_rate'])
     print('setting learning rate to %.7f' % resume_metadata['learning_rate'])
 
-for epoch in range(start_epoch, config.max_epoch):
-    for train_batch_idxs in train_data_iterator:
-        x_batch, mask_batch = create_batch(train_batch_idxs)
-        train_loss = 0.0
-        # train_loss = train(x_batch, mask_batch)
-        current_time = time.clock()
+init, train_op, loss_op = build_graph(x, mask, prob_dropout)
 
-        print('%d/%d (epoch %.3f) train_loss=%6.8f time/batch=%.2fs' % (
-            niter, max_niter, niter / float(train_batches_per_epoch), train_loss, current_time - prev_time))
+with tf.Session() as sess:
 
-        prev_time = current_time
-        losses_train.append(train_loss)
-        niter += 1
+    sess.run(init)
 
-        if niter % config.validate_every == 0:
-            print('Validating')
-            avg_valid_loss = 0
-            for valid_batch_idx in valid_data_iterator:
-                x_batch, mask_batch = create_batch(valid_batch_idx)
-                avg_valid_loss + 0.0
-                # avg_valid_loss += validate(x_batch, x_batch)
-            avg_valid_loss /= nvalid_batches
-            losses_eval_valid.append(avg_valid_loss)
-            print("    loss:\t%.6f" % avg_valid_loss)
-            print
+    for epoch in range(start_epoch, config.max_epoch):
+        for train_batch_idxs in train_data_iterator:
+            x_batch, mask_batch = create_batch(train_batch_idxs)
+            _, train_loss = sess.run(train_op, loss_op, feed_dict={x: x_batch, mask: mask_batch, prob_dropout: config.dropout})
+            # train_loss = train(x_batch, mask_batch)
+            current_time = time.clock()
 
-    # if epoch > config.learning_rate_decay_after:
-        # new_learning_rate = np.float32(learning_rate.get_value() * config.learning_rate_decay)
-        # learning_rate.set_value(new_learning_rate)
-        # print('setting learning rate to %.7f' % new_learning_rate)
+            print('%d/%d (epoch %.3f) train_loss=%6.8f time/batch=%.2fs' % (
+                niter, max_niter, niter / float(train_batches_per_epoch), train_loss, current_time - prev_time))
 
-    if (epoch + 1) % config.save_every == 0:
-        with open(metadata_target_path, 'w') as f:
-            pickle.dump({
-                'configuration': config_name,
-                'experiment_id': experiment_id,
-                'epoch_since_start': epoch,
-                'iters_since_start': niter,
-                'losses_train': losses_train,
-                'losses_eval_valid': losses_eval_valid,
-                # 'learning_rate': learning_rate.get_value(),
-                'token2idx': token2idx,
-                # 'param_values': nn.layers.get_all_param_values(l_out),
-            }, f, pickle.HIGHEST_PROTOCOL)
+            prev_time = current_time
+            losses_train.append(train_loss)
+            niter += 1
 
-        print("  saved to %s" % metadata_target_path)
+            if niter % config.validate_every == 0:
+                print('Validating')
+                avg_valid_loss = 0
+                for valid_batch_idx in valid_data_iterator:
+                    x_batch, mask_batch = create_batch(valid_batch_idx)
+                    avg_valid_loss += sess.run(loss_op, feed_dict = {x: x_batch, mask: mask_batch, prob_dropout: 0.0})
+                    # avg_valid_loss += validate(x_batch, x_batch)
+                avg_valid_loss /= nvalid_batches
+                losses_eval_valid.append(avg_valid_loss)
+                print("    loss:\t%.6f" % avg_valid_loss)
+                print
+
+        # if epoch > config.learning_rate_decay_after:
+            # new_learning_rate = np.float32(learning_rate.get_value() * config.learning_rate_decay)
+            # learning_rate.set_value(new_learning_rate)
+            # print('setting learning rate to %.7f' % new_learning_rate)
+
+        if (epoch + 1) % config.save_every == 0:
+            with open(metadata_target_path, 'w') as f:
+                pickle.dump({
+                    'configuration': config_name,
+                    'experiment_id': experiment_id,
+                    'epoch_since_start': epoch,
+                    'iters_since_start': niter,
+                    'losses_train': losses_train,
+                    'losses_eval_valid': losses_eval_valid,
+                    # 'learning_rate': learning_rate.get_value(),
+                    'token2idx': token2idx,
+                    # 'param_values': nn.layers.get_all_param_values(l_out),
+                }, f, pickle.HIGHEST_PROTOCOL)
+
+            print("  saved to %s" % metadata_target_path)
