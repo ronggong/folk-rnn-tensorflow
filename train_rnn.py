@@ -24,8 +24,8 @@ print(experiment_id)
 
 # metadata
 if not os.path.isdir('metadata'):
-        os.makedirs('metadata')
-metadata_target_path = 'metadata/%s.pkl' % experiment_id
+    os.makedirs('metadata')
+metadata_target_path = 'metadata'
 
 # logs
 if not os.path.isdir('logs'):
@@ -77,29 +77,47 @@ print('min, max length', min(tune_lens), max(tune_lens))
 
 x = tf.placeholder(tf.int32, [config.batch_size, None])
 mask = tf.placeholder(tf.float32, [config.batch_size, None])
+seq_length = tf.placeholder(tf.int32, [config.batch_size])
 prob_dropout = tf.placeholder_with_default(0.0, shape=())
 
 # model graph
-def build_graph(x, mask, prob_dropout):
+def build_graph(x, mask, seq_length, prob_dropout, batch_size):
+
     W_emb = tf.Variable(tf.eye(vocab_size, dtype=tf.float32), name='w_emb')
     l_emb = tf.nn.embedding_lookup(W_emb, x)
 
-    l_mask = mask
-
+    # change this in order to take the sequence length
     cells = [
-        tf.keras.layers.LSTMCell(units=config.rnn_size),
-        tf.keras.layers.LSTMCell(units=config.rnn_size),
-        tf.keras.layers.LSTMCell(units=config.rnn_size)
+        tf.nn.rnn_cell.LSTMCell(config.rnn_size),
+        tf.nn.rnn_cell.LSTMCell(config.rnn_size),
+        tf.nn.rnn_cell.LSTMCell(config.rnn_size)
     ]
-    rnn_output = tf.keras.layers.RNN(cells)(l_emb)
+
+    cell = tf.nn.rnn_cell.MultiRNNCell(cells)
+
+    initial_state = cell.zero_state(batch_size, tf.float32)
+
+    rnn_output, _ = tf.nn.dynamic_rnn(cell, 
+                                      l_emb, 
+                                      initial_state=initial_state, 
+                                      sequence_length=seq_length) 
 
     if config.dropout > 0:
         rnn_output = tf.keras.layers.Dropout(prob_dropout)(rnn_output)
 
     l_reshp = tf.reshape(rnn_output, (-1, config.rnn_size))
+
     l_out = tf.keras.layers.Dense(units=vocab_size, 
                                   kernel_initializer=tf.initializers.orthogonal, 
                                   activation=tf.nn.softmax)(l_reshp)
+
+    # output overall params
+    print("total parameters", np.sum([np.prod(v.shape) for v in tf.trainable_variables()]))
+    # output layer type, num_param, output_shape
+    print('Embedding shape', l_emb.get_shape())
+    print('RNN output shape', rnn_output.get_shape())
+    print('Reshape shape', l_reshp.get_shape())
+    print('Dense shape', l_out.get_shape())
 
     y = tf.keras.backend.flatten(x[:, 1:])
 
@@ -111,24 +129,26 @@ def build_graph(x, mask, prob_dropout):
     # sum on the timestamp axis, and then sum on the sample axis
     loss = -1. * tf.reduce_mean(tf.reduce_sum(mask * p1, axis=1), axis=0)
 
-    optimizer = tf.train.RMSPropOptimizer(learning_rate=config.learning_rate)
+    # optimizer
+    var_lr = tf.Variable(config.learning_rate ,trainable=False)
+    optimizer = tf.train.RMSPropOptimizer(learning_rate=var_lr)
     gradients, variables = zip(*optimizer.compute_gradients(loss))
     gradients, _ = tf.clip_by_global_norm(gradients, config.grad_clipping)
     train_op = optimizer.apply_gradients(zip(gradients, variables))
-    # train_op = optimizer.minimize(loss)
 
-    init = tf.global_variables_initializer()
-    return init, train_op, loss
+    return train_op, loss, var_lr
 
 # create batch
 def create_batch(idxs):
     max_seq_len = max([len(tunes[i]) for i in idxs])
     x = np.zeros((config.batch_size, max_seq_len), dtype='float32')
+    sequence_length = np.zeros((config.batch_size,), dtype='int32')
     mask = np.zeros((config.batch_size, max_seq_len - 1), dtype='float32')
     for i, j in enumerate(idxs):
         x[i, :tune_lens[j]] = tunes[j]
+        sequence_length[i] = tune_lens[j]
         mask[i, : tune_lens[j] - 1] = 1
-    return x, mask
+    return x, sequence_length, mask
 
 train_data_iterator = DataIterator(tune_lens[train_idxs], train_idxs, config.batch_size, random_lens=False)
 valid_data_iterator = DataIterator(tune_lens[valid_idxs], valid_idxs, config.batch_size, random_lens=False)
@@ -140,33 +160,39 @@ losses_train = []
 
 nvalid_batches = nvalid_tunes / config.batch_size
 losses_eval_valid = []
-niter = 1
+niter = 0
 start_epoch = 0
 prev_time = time.clock()
 
-# resume the training
-if hasattr(config, 'resume_path'):
-    print('Load metadata for resuming')
-    with open(config.resume_path) as f:
-        resume_metadata = pickle.load(f)
+train_op, loss_op, var_lr = build_graph(x, mask, seq_length, prob_dropout, config.batch_size)
 
-    # nn.layers.set_all_param_values(l_out, resume_metadata['param_values'])
-    start_epoch = resume_metadata['epoch_since_start'] + 1
-    niter = resume_metadata['iters_since_start']
-    # learning_rate.set_value(resume_metadata['learning_rate'])
-    print('setting learning rate to %.7f' % resume_metadata['learning_rate'])
+init = tf.global_variables_initializer()
 
-init, train_op, loss_op = build_graph(x, mask, prob_dropout)
+saver = tf.train.Saver(max_to_keep=5)
 
 with tf.Session() as sess:
 
     sess.run(init)
 
+    # restore the checkpoint
+    if not os.path.exists(metadata_target_path):
+        print('[!] Checkpoints path does not exist...')
+        quit()
+
+    ckpt = tf.train.get_checkpoint_state(metadata_target_path)
+
+    if ckpt and ckpt.model_checkpoint_path:
+        ckpt_name = os.path.basename(ckpt.model_checkpoint_path)
+        saver.restore(sess, os.path.join(metadata_target_path, ckpt_name))
+        print('[*] Read {}'.format(ckpt_name))
+
     for epoch in range(start_epoch, config.max_epoch):
         for train_batch_idxs in train_data_iterator:
-            x_batch, mask_batch = create_batch(train_batch_idxs)
-            _, train_loss = sess.run(train_op, loss_op, feed_dict={x: x_batch, mask: mask_batch, prob_dropout: config.dropout})
-            # train_loss = train(x_batch, mask_batch)
+            x_batch, sequence_length, mask_batch = create_batch(train_batch_idxs)
+            _, train_loss = sess.run([train_op, loss_op], feed_dict={x: x_batch, 
+                                                                     mask: mask_batch, 
+                                                                     seq_length: sequence_length,
+                                                                     prob_dropout: config.dropout})
             current_time = time.clock()
 
             print('%d/%d (epoch %.3f) train_loss=%6.8f time/batch=%.2fs' % (
@@ -180,31 +206,21 @@ with tf.Session() as sess:
                 print('Validating')
                 avg_valid_loss = 0
                 for valid_batch_idx in valid_data_iterator:
-                    x_batch, mask_batch = create_batch(valid_batch_idx)
-                    avg_valid_loss += sess.run(loss_op, feed_dict = {x: x_batch, mask: mask_batch, prob_dropout: 0.0})
+                    x_batch, sequence_length, mask_batch = create_batch(valid_batch_idx)
+                    avg_valid_loss += sess.run(loss_op, feed_dict = {x: x_batch,
+                                                                     mask: mask_batch,
+                                                                     seq_length: sequence_length,
+                                                                     prob_dropout: 0.0})
                     # avg_valid_loss += validate(x_batch, x_batch)
                 avg_valid_loss /= nvalid_batches
                 losses_eval_valid.append(avg_valid_loss)
                 print("    loss:\t%.6f" % avg_valid_loss)
                 print
 
-        # if epoch > config.learning_rate_decay_after:
-            # new_learning_rate = np.float32(learning_rate.get_value() * config.learning_rate_decay)
-            # learning_rate.set_value(new_learning_rate)
-            # print('setting learning rate to %.7f' % new_learning_rate)
+        if epoch > config.learning_rate_decay_after:
+            new_learning_rate = np.float32(sess.run(var_lr) * config.learning_rate_decay)
+            sess.run(tf.assign(var_lr, new_learning_rate))
+            print('setting learning rate to %.7f' % new_learning_rate)
 
         if (epoch + 1) % config.save_every == 0:
-            with open(metadata_target_path, 'w') as f:
-                pickle.dump({
-                    'configuration': config_name,
-                    'experiment_id': experiment_id,
-                    'epoch_since_start': epoch,
-                    'iters_since_start': niter,
-                    'losses_train': losses_train,
-                    'losses_eval_valid': losses_eval_valid,
-                    # 'learning_rate': learning_rate.get_value(),
-                    'token2idx': token2idx,
-                    # 'param_values': nn.layers.get_all_param_values(l_out),
-                }, f, pickle.HIGHEST_PROTOCOL)
-
-            print("  saved to %s" % metadata_target_path)
+            saver.save(sess, os.path.join(metadata_target_path, experiment_id), global_step=niter)

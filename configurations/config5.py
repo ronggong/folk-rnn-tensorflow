@@ -8,9 +8,9 @@ learning_rate = 0.003
 learning_rate_decay_after = 20
 learning_rate_decay = 0.97
 
-batch_size = 64
+batch_size = 2
 max_epoch = 100
-grad_clipping = 5.
+grad_clipping = 5.0
 validation_fraction = 0.05
 validate_every = 1000  # iterations
 
