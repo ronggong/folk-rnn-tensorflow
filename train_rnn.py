@@ -81,26 +81,33 @@ seq_length = tf.placeholder(tf.int32, [config.batch_size])
 prob_dropout = tf.placeholder_with_default(0.0, shape=())
 
 # model graph
-def build_graph(x, mask, seq_length, prob_dropout, batch_size):
+def build_graph(x, mask, seq_length, prob_dropout, batch_size, cudnn_lstm):
 
     W_emb = tf.Variable(tf.eye(vocab_size, dtype=tf.float32), name='w_emb')
     l_emb = tf.nn.embedding_lookup(W_emb, x)
 
-    # change this in order to take the sequence length
-    cells = [
-        tf.nn.rnn_cell.LSTMCell(config.rnn_size),
-        tf.nn.rnn_cell.LSTMCell(config.rnn_size),
-        tf.nn.rnn_cell.LSTMCell(config.rnn_size)
-    ]
+    if cudnn_lstm:
+        lstm = tf.contrib.cudnn_rnn.CudnnLSTM(
+            3,
+            config.rnn_size,
+            direction='unidirectional',
+            dropout=0,
+        )
 
-    cell = tf.nn.rnn_cell.MultiRNNCell(cells)
+        is_training = False if prob_dropout==0 else True
+        initial_state = tf.zeros([batch_size, config.rnn_size], tf.float32)
+        rnn_output, _ = lstm(l_emb, initial_state=initial_state, training=is_training)
+    else:
+        cells = [tf.contrib.cudnn_rnn.CudnnCompatibleLSTMCell(config.rnn_size) for _ in range(3)]
 
-    initial_state = cell.zero_state(batch_size, tf.float32)
+        cell = tf.nn.rnn_cell.MultiRNNCell(cells)
 
-    rnn_output, _ = tf.nn.dynamic_rnn(cell, 
-                                      l_emb, 
-                                      initial_state=initial_state, 
-                                      sequence_length=seq_length) 
+        initial_state = cell.zero_state(batch_size, tf.float32)
+
+        rnn_output, _ = tf.nn.dynamic_rnn(cell, 
+                                          l_emb, 
+                                          initial_state=initial_state, 
+                                          sequence_length=seq_length) 
 
     if config.dropout > 0:
         rnn_output = tf.keras.layers.Dropout(prob_dropout)(rnn_output)
@@ -164,7 +171,7 @@ niter = 0
 start_epoch = 0
 prev_time = time.clock()
 
-train_op, loss_op, var_lr = build_graph(x, mask, seq_length, prob_dropout, config.batch_size)
+train_op, loss_op, var_lr = build_graph(x, mask, seq_length, prob_dropout, config.batch_size, config.cudnn_lstm)
 
 init = tf.global_variables_initializer()
 
@@ -181,11 +188,13 @@ with tf.Session() as sess:
 
     ckpt = tf.train.get_checkpoint_state(metadata_target_path)
 
+    # read the check point if it is there
     if ckpt and ckpt.model_checkpoint_path:
         ckpt_name = os.path.basename(ckpt.model_checkpoint_path)
+        experiment_id = ckpt_name
         saver.restore(sess, os.path.join(metadata_target_path, ckpt_name))
         print('[*] Read {}'.format(ckpt_name))
-
+    
     for epoch in range(start_epoch, config.max_epoch):
         for train_batch_idxs in train_data_iterator:
             x_batch, sequence_length, mask_batch = create_batch(train_batch_idxs)
@@ -217,10 +226,13 @@ with tf.Session() as sess:
                 print("    loss:\t%.6f" % avg_valid_loss)
                 print
 
+            # test model save, will be removed
+            saver.save(sess, os.path.join(metadata_target_path, experiment_id), global_step=niter)
+
         if epoch > config.learning_rate_decay_after:
             new_learning_rate = np.float32(sess.run(var_lr) * config.learning_rate_decay)
             sess.run(tf.assign(var_lr, new_learning_rate))
             print('setting learning rate to %.7f' % new_learning_rate)
 
-        if (epoch + 1) % config.save_every == 0:
-            saver.save(sess, os.path.join(metadata_target_path, experiment_id), global_step=niter)
+        # if (epoch + 1) % config.save_every == 0:
+        #     saver.save(sess, os.path.join(metadata_target_path, experiment_id), global_step=niter)

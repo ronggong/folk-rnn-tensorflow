@@ -14,4 +14,6 @@ grad_clipping = 5.0
 validation_fraction = 0.05
 validate_every = 1000  # iterations
 
-save_every = 10  # epochs
+save_every = 1  # epochs
+
+cudnn_lstm = False
