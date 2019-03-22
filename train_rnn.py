@@ -85,41 +85,44 @@ def build_graph(x, mask, seq_length, prob_dropout, batch_size, cudnn_lstm):
 
     W_emb = tf.Variable(tf.eye(vocab_size, dtype=tf.float32), name='w_emb')
     l_emb = tf.nn.embedding_lookup(W_emb, x)
-
+   
+    # cudnn
     if cudnn_lstm:
         lstm = tf.contrib.cudnn_rnn.CudnnLSTM(
             3,
             config.rnn_size,
             direction='unidirectional',
             dropout=0,
+            bias_initializer=tf.zeros_initializer()
         )
 
         is_training = False if prob_dropout==0 else True
-        initial_state = tf.zeros([batch_size, config.rnn_size], tf.float32)
-        rnn_output, _ = lstm(l_emb, initial_state=initial_state, training=is_training)
+        rnn_output, _ = lstm(l_emb, initial_state=None, training=is_training)
     else:
-        cells = [tf.contrib.cudnn_rnn.CudnnCompatibleLSTMCell(config.rnn_size) for _ in range(3)]
+        # cudnn compatible lstm for training or inference
+        with tf.variable_scope('cudnn_lstm'):
+            cells = [tf.contrib.cudnn_rnn.CudnnCompatibleLSTMCell(config.rnn_size) for _ in range(3)]
+            
+            cell = tf.contrib.rnn.MultiRNNCell(cells)
+            
+            initial_state = cell.zero_state(config.batch_size, tf.float32)
 
-        cell = tf.nn.rnn_cell.MultiRNNCell(cells)
-
-        initial_state = cell.zero_state(batch_size, tf.float32)
-
-        rnn_output, _ = tf.nn.dynamic_rnn(cell, 
-                                          l_emb, 
-                                          initial_state=initial_state, 
-                                          sequence_length=seq_length) 
+            rnn_output, _ = tf.nn.dynamic_rnn(cell,
+                                              l_emb,
+                                              initial_state=initial_state,
+                                              sequence_length=seq_length)
 
     if config.dropout > 0:
         rnn_output = tf.keras.layers.Dropout(prob_dropout)(rnn_output)
 
     l_reshp = tf.reshape(rnn_output, (-1, config.rnn_size))
 
-    l_out = tf.keras.layers.Dense(units=vocab_size, 
-                                  kernel_initializer=tf.initializers.orthogonal, 
+    l_out = tf.keras.layers.Dense(units=vocab_size,
+                                  kernel_initializer=tf.initializers.orthogonal,
                                   activation=tf.nn.softmax)(l_reshp)
 
     # output overall params
-    print("total parameters", np.sum([np.prod(v.shape) for v in tf.trainable_variables()]))
+    #print("total parameters", np.sum([np.prod(v.shape) for v in tf.trainable_variables()]))
     # output layer type, num_param, output_shape
     print('Embedding shape', l_emb.get_shape())
     print('RNN output shape', rnn_output.get_shape())
@@ -132,7 +135,7 @@ def build_graph(x, mask, seq_length, prob_dropout, batch_size, cudnn_lstm):
     # predictions, dim_0: sample number, dim_1: the next token in the sample
     index = tf.stack([tf.range(tf.shape(y)[0]), y], axis=1)
     p1 = tf.reshape(tf.log(tf.gather_nd(l_out, index)), tf.shape(mask))
-    # mask the short sequence value , 
+    # mask the short sequence value ,
     # sum on the timestamp axis, and then sum on the sample axis
     loss = -1. * tf.reduce_mean(tf.reduce_sum(mask * p1, axis=1), axis=0)
 
@@ -177,10 +180,13 @@ init = tf.global_variables_initializer()
 
 saver = tf.train.Saver(max_to_keep=5)
 
-with tf.Session() as sess:
+conf = tf.ConfigProto()
+conf.gpu_options.allow_growth=True
+
+with tf.Session(config=conf) as sess:
 
     sess.run(init)
-
+    
     # restore the checkpoint
     if not os.path.exists(metadata_target_path):
         print('[!] Checkpoints path does not exist...')
@@ -226,13 +232,10 @@ with tf.Session() as sess:
                 print("    loss:\t%.6f" % avg_valid_loss)
                 print
 
-            # test model save, will be removed
-            saver.save(sess, os.path.join(metadata_target_path, experiment_id), global_step=niter)
-
         if epoch > config.learning_rate_decay_after:
             new_learning_rate = np.float32(sess.run(var_lr) * config.learning_rate_decay)
             sess.run(tf.assign(var_lr, new_learning_rate))
             print('setting learning rate to %.7f' % new_learning_rate)
 
-        # if (epoch + 1) % config.save_every == 0:
-        #     saver.save(sess, os.path.join(metadata_target_path, experiment_id), global_step=niter)
+        if (epoch + 1) % config.save_every == 0:
+            saver.save(sess, os.path.join(metadata_target_path, experiment_id), global_step=niter)
