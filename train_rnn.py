@@ -165,17 +165,6 @@ with tf.Session(config=conf) as sess:
                 print("    loss:\t%.6f" % avg_valid_loss)
                 print
 
-            saver.save(sess, os.path.join(metadata_target_path, experiment_id), global_step=niter)
-
-            with open(os.path.join(metadata_target_path, 'metadata.pkl'), 'wb') as f:
-                pickle.dump({
-                    'configuration': config_name,
-                    'experiment_id': experiment_id,
-                    'token2idx': token2idx,
-                }, f)
-
-            print("  saved to %s" % metadata_target_path)
-
         if epoch > config.learning_rate_decay_after:
             new_learning_rate = np.float32(sess.run(var_lr) * config.learning_rate_decay)
             sess.run(tf.assign(var_lr, new_learning_rate))
