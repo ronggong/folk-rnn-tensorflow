@@ -8,6 +8,7 @@ import importlib
 import numpy as np
 import tensorflow as tf
 from data_iter import DataIterator
+from graph import build_graph
 
 if len(sys.argv) < 3:
     sys.exit("Usage: train_rnn.py <configuration_name> <train data filename>")
@@ -75,79 +76,6 @@ print('n train tunes:', ntrain_tunes)
 print('n validation tunes:', nvalid_tunes)
 print('min, max length', min(tune_lens), max(tune_lens))
 
-x = tf.placeholder(tf.int32, [config.batch_size, None])
-mask = tf.placeholder(tf.float32, [config.batch_size, None])
-seq_length = tf.placeholder(tf.int32, [config.batch_size])
-prob_dropout = tf.placeholder_with_default(0.0, shape=())
-
-# model graph
-def build_graph(x, mask, seq_length, prob_dropout, batch_size, cudnn_lstm):
-
-    W_emb = tf.Variable(tf.eye(vocab_size, dtype=tf.float32), name='w_emb')
-    l_emb = tf.nn.embedding_lookup(W_emb, x)
-   
-    # cudnn
-    if cudnn_lstm:
-        lstm = tf.contrib.cudnn_rnn.CudnnLSTM(
-            3,
-            config.rnn_size,
-            direction='unidirectional',
-            dropout=0,
-            bias_initializer=tf.zeros_initializer()
-        )
-
-        is_training = False if prob_dropout==0 else True
-        rnn_output, _ = lstm(l_emb, initial_state=None, training=is_training)
-    else:
-        # cudnn compatible lstm for training or inference
-        with tf.variable_scope('cudnn_lstm'):
-            cells = [tf.contrib.cudnn_rnn.CudnnCompatibleLSTMCell(config.rnn_size) for _ in range(3)]
-            
-            cell = tf.contrib.rnn.MultiRNNCell(cells)
-            
-            initial_state = cell.zero_state(config.batch_size, tf.float32)
-
-            rnn_output, _ = tf.nn.dynamic_rnn(cell,
-                                              l_emb,
-                                              initial_state=initial_state,
-                                              sequence_length=seq_length)
-
-    if config.dropout > 0:
-        rnn_output = tf.keras.layers.Dropout(prob_dropout)(rnn_output)
-
-    l_reshp = tf.reshape(rnn_output, (-1, config.rnn_size))
-
-    l_out = tf.keras.layers.Dense(units=vocab_size,
-                                  kernel_initializer=tf.initializers.orthogonal,
-                                  activation=tf.nn.softmax)(l_reshp)
-
-    # output overall params
-    #print("total parameters", np.sum([np.prod(v.shape) for v in tf.trainable_variables()]))
-    # output layer type, num_param, output_shape
-    print('Embedding shape', l_emb.get_shape())
-    print('RNN output shape', rnn_output.get_shape())
-    print('Reshape shape', l_reshp.get_shape())
-    print('Dense shape', l_out.get_shape())
-
-    y = tf.keras.backend.flatten(x[:, 1:])
-
-    # training loss
-    # predictions, dim_0: sample number, dim_1: the next token in the sample
-    index = tf.stack([tf.range(tf.shape(y)[0]), y], axis=1)
-    p1 = tf.reshape(tf.log(tf.gather_nd(l_out, index)), tf.shape(mask))
-    # mask the short sequence value ,
-    # sum on the timestamp axis, and then sum on the sample axis
-    loss = -1. * tf.reduce_mean(tf.reduce_sum(mask * p1, axis=1), axis=0)
-
-    # optimizer
-    var_lr = tf.Variable(config.learning_rate ,trainable=False)
-    optimizer = tf.train.RMSPropOptimizer(learning_rate=var_lr)
-    gradients, variables = zip(*optimizer.compute_gradients(loss))
-    gradients, _ = tf.clip_by_global_norm(gradients, config.grad_clipping)
-    train_op = optimizer.apply_gradients(zip(gradients, variables))
-
-    return train_op, loss, var_lr
-
 # create batch
 def create_batch(idxs):
     max_seq_len = max([len(tunes[i]) for i in idxs])
@@ -174,7 +102,12 @@ niter = 0
 start_epoch = 0
 prev_time = time.clock()
 
-train_op, loss_op, var_lr = build_graph(x, mask, seq_length, prob_dropout, config.batch_size, config.cudnn_lstm)
+x = tf.placeholder(tf.int32, [config.batch_size, None])
+mask = tf.placeholder(tf.float32, [config.batch_size, None])
+seq_length = tf.placeholder(tf.int32, [config.batch_size])
+prob_dropout = tf.placeholder_with_default(0.0, shape=())
+
+_, train_op, loss_op, var_lr = build_graph(x, mask, seq_length, prob_dropout, config, vocab_size)
 
 init = tf.global_variables_initializer()
 
@@ -232,6 +165,17 @@ with tf.Session(config=conf) as sess:
                 print("    loss:\t%.6f" % avg_valid_loss)
                 print
 
+            saver.save(sess, os.path.join(metadata_target_path, experiment_id), global_step=niter)
+
+            with open(os.path.join(metadata_target_path, 'metadata.pkl'), 'wb') as f:
+                pickle.dump({
+                    'configuration': config_name,
+                    'experiment_id': experiment_id,
+                    'token2idx': token2idx,
+                }, f)
+
+            print("  saved to %s" % metadata_target_path)
+
         if epoch > config.learning_rate_decay_after:
             new_learning_rate = np.float32(sess.run(var_lr) * config.learning_rate_decay)
             sess.run(tf.assign(var_lr, new_learning_rate))
@@ -239,3 +183,12 @@ with tf.Session(config=conf) as sess:
 
         if (epoch + 1) % config.save_every == 0:
             saver.save(sess, os.path.join(metadata_target_path, experiment_id), global_step=niter)
+
+            with open(os.path.join(metadata_target_path, 'metadata.pkl'), 'wb') as f:
+                pickle.dump({
+                    'configuration': config_name,
+                    'experiment_id': experiment_id,
+                    'token2idx': token2idx,
+                }, f)
+
+            print("  saved to %s" % metadata_target_path)
